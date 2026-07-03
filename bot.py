@@ -8,7 +8,7 @@ TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DB_FILE = "s4s.db"
 
 
-# ───────────────────────── DB ─────────────────────────
+# ───────────────────────── DATABASE ─────────────────────────
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -49,10 +49,17 @@ async def init_db():
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS s4s_logs (
+            guild_id TEXT PRIMARY KEY,
+            channel_id INTEGER
+        )
+        """)
+
         await db.commit()
 
 
-# ───────────────────────── BOT ─────────────────────────
+# ───────────────────────── BOT SETUP ─────────────────────────
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -70,7 +77,7 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-# ───────────────────────── CHECK S4S MESSAGES ─────────────────────────
+# ───────────────────────── S4S CHECK ─────────────────────────
 
 @bot.event
 async def on_message(message):
@@ -102,29 +109,37 @@ async def on_message(message):
 
         last = datetime.fromisoformat(row[0]) if row else None
 
+        # allow
         if last is None or (now - last) >= timedelta(hours=24):
+
             await db.execute("""
-                INSERT INTO cooldowns VALUES (?, ?, ?)
-                ON CONFLICT(guild_id, user_id)
-                DO UPDATE SET last_ping=excluded.last_ping
+            INSERT INTO cooldowns VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET last_ping=excluded.last_ping
             """, (gid, uid, now.isoformat()))
+
             await db.commit()
 
             await message.channel.send(
-                embed=discord.Embed(title="✅ Ping used", color=discord.Color.green())
+                embed=discord.Embed(
+                    title="✅ S4S Ping Used",
+                    color=discord.Color.green()
+                )
             )
             return
 
+        # delete spam
         try:
             await message.delete()
         except:
             pass
 
         await db.execute("""
-            INSERT INTO warnings VALUES (?, ?, 1)
-            ON CONFLICT(guild_id, user_id)
-            DO UPDATE SET count=count+1
+        INSERT INTO warnings VALUES (?, ?, 1)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET count=count+1
         """, (gid, uid))
+
         await db.commit()
 
         async with db.execute(
@@ -156,27 +171,24 @@ def admin_only():
 
 # ───────────────────────── CREATE S4S ─────────────────────────
 
-@tree.command(name="makes4schannel", description="Create S4S channel with owner + category")
+@tree.command(name="makes4schannel", description="Create S4S channel")
 @app_commands.describe(
     name="Channel name",
-    owner="Owner of this S4S channel",
-    category="Category name"
+    owner="Owner",
+    category="Category"
 )
 @admin_only()
 async def makes4schannel(interaction: discord.Interaction, name: str, owner: discord.Member, category: str):
 
     guild = interaction.guild
 
-    # category
     cat = discord.utils.get(guild.categories, name=category)
     if not cat:
         cat = await guild.create_category(category)
 
-    # role
     role = await guild.create_role(name=f"S4S | {owner.display_name}")
     await owner.add_roles(role)
 
-    # permissions
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(send_messages=False),
         role: discord.PermissionOverwrite(send_messages=True, view_channel=True),
@@ -191,87 +203,131 @@ async def makes4schannel(interaction: discord.Interaction, name: str, owner: dis
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO s4s_channels VALUES (?, ?)", (str(guild.id), channel.id))
-        await db.execute(
-            "INSERT INTO s4s_owners VALUES (?, ?, ?, ?)",
-            (str(guild.id), channel.id, str(owner.id), role.id)
-        )
+        await db.execute("INSERT INTO s4s_owners VALUES (?, ?, ?, ?)",
+                         (str(guild.id), channel.id, str(owner.id), role.id))
         await db.commit()
 
     await interaction.response.send_message(
-        embed=discord.Embed(
-            title="📢 S4S Created",
-            description=f"{channel.mention} owned by {owner.mention}",
-            color=discord.Color.green()
-        ),
+        embed=discord.Embed(title="Created S4S", description=channel.mention),
         ephemeral=True
     )
 
 
-# ───────────────────────── TRANSFER OWNER ─────────────────────────
+# ───────────────────────── S4S INFO ─────────────────────────
 
-@tree.command(name="transferowner")
+@tree.command(name="s4sinfo")
 @admin_only()
-async def transferowner(interaction: discord.Interaction, channel: discord.TextChannel, new_owner: discord.Member):
+async def s4sinfo(interaction: discord.Interaction):
 
     gid = str(interaction.guild.id)
 
     async with aiosqlite.connect(DB_FILE) as db:
 
         async with db.execute(
-            "SELECT role_id FROM s4s_owners WHERE guild_id=? AND channel_id=?",
-            (gid, channel.id)
+            "SELECT COUNT(*) FROM s4s_channels WHERE guild_id=?",
+            (gid,)
         ) as cur:
-            row = await cur.fetchone()
-
-        if not row:
-            return await interaction.response.send_message("Not S4S channel", ephemeral=True)
-
-        old_role = channel.guild.get_role(row[0])
-        if old_role:
-            await old_role.delete()
-
-        new_role = await interaction.guild.create_role(name=f"S4S | {new_owner.display_name}")
-        await new_owner.add_roles(new_role)
-
-        await db.execute("""
-            UPDATE s4s_owners
-            SET user_id=?, role_id=?
-            WHERE guild_id=? AND channel_id=?
-        """, (str(new_owner.id), new_role.id, gid, channel.id))
-
-        await db.commit()
-
-    await interaction.response.send_message("Owner transferred", ephemeral=True)
-
-
-# ───────────────────────── REMOVE S4S ─────────────────────────
-
-@tree.command(name="removes4schannel")
-@admin_only()
-async def removes4schannel(interaction: discord.Interaction, channel: discord.TextChannel):
-
-    gid = str(interaction.guild.id)
-
-    async with aiosqlite.connect(DB_FILE) as db:
+            total = (await cur.fetchone())[0]
 
         async with db.execute(
-            "SELECT role_id FROM s4s_owners WHERE guild_id=? AND channel_id=?",
-            (gid, channel.id)
+            "SELECT COUNT(*) FROM warnings WHERE guild_id=?",
+            (gid,)
         ) as cur:
-            row = await cur.fetchone()
+            warns = (await cur.fetchone())[0]
 
-        if row:
-            role = channel.guild.get_role(row[0])
-            if role:
-                await role.delete()
+    embed = discord.Embed(title="📊 S4S Stats")
+    embed.add_field(name="Channels", value=str(total))
+    embed.add_field(name="Total Warn Records", value=str(warns))
 
-        await db.execute("DELETE FROM s4s_channels WHERE guild_id=? AND channel_id=?", (gid, channel.id))
-        await db.execute("DELETE FROM s4s_owners WHERE guild_id=? AND channel_id=?", (gid, channel.id))
+    await interaction.response.send_message(embed=embed)
+
+
+# ───────────────────────── RESET COMMANDS ─────────────────────────
+
+@tree.command(name="resetwarnings")
+@admin_only()
+async def resetwarnings(interaction: discord.Interaction, user: discord.Member):
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE warnings SET count=0 WHERE guild_id=? AND user_id=?",
+            (str(interaction.guild.id), str(user.id))
+        )
         await db.commit()
 
-    await channel.delete()
+    await interaction.response.send_message("Warnings reset", ephemeral=True)
 
-    await interaction.response.send_message("S4S removed", ephemeral=True)
 
+@tree.command(name="resetcooldown")
+@admin_only()
+async def resetcooldown(interaction: discord.Interaction, user: discord.Member):
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "DELETE FROM cooldowns WHERE guild_id=? AND user_id=?",
+            (str(interaction.guild.id), str(user.id))
+        )
+        await db.commit()
+
+    await interaction.response.send_message("Cooldown reset", ephemeral=True)
+
+
+# ───────────────────────── LOCK / UNLOCK ─────────────────────────
+
+@tree.command(name="s4slock")
+@admin_only()
+async def s4slock(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    await channel.set_permissions(interaction.guild.default_role, send_messages=False)
+    await interaction.response.send_message("Locked", ephemeral=True)
+
+
+@tree.command(name="s4sunlock")
+@admin_only()
+async def s4sunlock(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    await channel.set_permissions(interaction.guild.default_role, send_messages=True)
+    await interaction.response.send_message("Unlocked", ephemeral=True)
+
+
+# ───────────────────────── LEADERBOARD ─────────────────────────
+
+@tree.command(name="s4sleaderboard")
+@admin_only()
+async def leaderboard(interaction: discord.Interaction):
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT user_id, count FROM warnings WHERE guild_id=? ORDER BY count DESC LIMIT 10",
+            (str(interaction.guild.id),)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    desc = ""
+    for i, r in enumerate(rows, start=1):
+        user = await interaction.guild.fetch_member(int(r[0]))
+        desc += f"{i}. {user.name} - {r[1]} warns\n"
+
+    embed = discord.Embed(title="📈 S4S Leaderboard", description=desc or "No data")
+    await interaction.response.send_message(embed=embed)
+
+
+# ───────────────────────── LOG CHANNEL ─────────────────────────
+
+@tree.command(name="sets4slogs")
+@admin_only()
+async def sets4slogs(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO s4s_logs VALUES (?, ?)",
+            (str(interaction.guild.id), channel.id)
+        )
+        await db.commit()
+
+    await interaction.response.send_message("Logs set", ephemeral=True)
+
+
+# ───────────────────────── RUN BOT ─────────────────────────
 
 bot.run(TOKEN)
