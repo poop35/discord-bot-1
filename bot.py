@@ -276,6 +276,35 @@ async def s4sinfo(interaction: discord.Interaction):
     embed.add_field(name="Ping Limit", value="1 @everyone per 24h", inline=True)
     embed.add_field(name="Warning Limit", value="3 warnings → channel deleted", inline=True)
     await interaction.response.send_message(embed=embed)
+@tree.command(name="makes4schannel", description="Create a new S4S channel. (Admin)")
+@app_commands.describe(name="Name of the new S4S channel")
+@admin_only()
+async def makes4schannel(interaction: discord.Interaction, name: str):
 
+    # Create the channel
+    channel = await interaction.guild.create_text_channel(name)
+
+    # Register it as an S4S channel
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO s4s_channels (guild_id, channel_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            (str(interaction.guild_id), channel.id)
+        )
+        await db.commit()
+
+    # Optional starter message
+    await channel.send(
+        "# 📢 S4S Channel\n"
+        "Welcome! This channel is monitored by the S4S bot.\n"
+        "You may use **1 @everyone ping every 24 hours.**"
+    )
+
+    embed = discord.Embed(
+        title="✅ S4S Channel Created",
+        description=f"{channel.mention} has been created and registered as an S4S channel.",
+        color=discord.Color.green()
+    )
+
+    await interaction.response.send_message(embed=embed)
 
 bot.run(TOKEN)
